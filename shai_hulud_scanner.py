@@ -79,6 +79,16 @@ LOCKFILES = {
 CACHE_DIR = Path.home() / ".cache" / "shai-hulud-scanner"
 CACHE_TTL = 86400  # 24 hours in seconds
 
+# Exit codes
+EXIT_CLEAN = 0
+EXIT_FINDINGS = 1
+EXIT_NO_IOC_DATA = 2
+
+# Network retry settings
+RETRY_ATTEMPTS = 3
+RETRY_BACKOFF_BASE = 1.0  # seconds
+RETRY_BACKOFF_MAX = 10.0  # seconds
+
 
 class Colors:
     """ANSI color codes for terminal output."""
@@ -160,6 +170,38 @@ class ScanResult:
         }
 
 
+@dataclass
+class IoCDataStatus:
+    """Tracks the source and freshness of IoC data."""
+
+    source: str  # "network", "cache", "expired_cache", "bundled", "none"
+    age_seconds: float | None = None
+    package_count: int = 0
+
+    @property
+    def is_stale(self) -> bool:
+        """Data is stale if from expired cache or bundled baseline."""
+        return self.source in ("expired_cache", "bundled")
+
+    @property
+    def is_available(self) -> bool:
+        """Check if any IoC data is available."""
+        return self.source != "none"
+
+    @property
+    def age_human(self) -> str:
+        """Human-readable age string."""
+        if self.age_seconds is None:
+            return "unknown"
+        hours = self.age_seconds / 3600
+        if hours < 1:
+            return f"{int(self.age_seconds / 60)} minutes"
+        elif hours < 24:
+            return f"{hours:.1f} hours"
+        else:
+            return f"{hours / 24:.1f} days"
+
+
 class IoCCache:
     """Manages caching of IoC lists."""
 
@@ -173,22 +215,38 @@ class IoCCache:
         url_hash = hashlib.sha256(url.encode()).hexdigest()[:16]
         return self.cache_dir / f"{url_hash}.json"
 
-    def get(self, url: str) -> dict | list | None:
-        """Get cached data if valid."""
+    def get(
+        self, url: str, allow_expired: bool = False
+    ) -> tuple[dict | list | None, float | None]:
+        """
+        Get cached data.
+
+        Args:
+            url: The URL key for cached data
+            allow_expired: If True, return expired data instead of None
+
+        Returns:
+            Tuple of (data, age_seconds). Data is None if not found or
+            expired (when allow_expired=False).
+        """
         cache_path = self._cache_path(url)
         if not cache_path.exists():
-            return None
+            return None, None
 
         try:
             with cache_path.open() as f:
                 cached = json.load(f)
 
-            if time.time() - cached.get("cached_at", 0) > self.ttl:
-                return None
+            cached_at = cached.get("cached_at", 0)
+            age = time.time() - cached_at
+            data = cached.get("data")
 
-            return cached.get("data")
+            if age > self.ttl and not allow_expired:
+                return None, age  # Return age so caller knows data exists
+
+            return data, age
         except (json.JSONDecodeError, OSError):
-            return None
+            return None, None
 
     def set(self, url: str, data: dict | list) -> None:
         """Cache data for a URL."""
@@ -216,10 +274,17 @@ class ShaiHuludScanner:
         verbose: bool = False,
         refresh_ioc: bool = False,
         json_output: bool = False,
+        strict: bool = False,
+        offline: bool = False,
+        max_cache_age: int | None = None,
     ) -> None:
         self.verbose = verbose
         self.json_output = json_output
-        self.cache = IoCCache()
+        self.strict = strict
+        self.offline_mode = offline
+
+        ttl = max_cache_age * 3600 if max_cache_age else CACHE_TTL
+        self.cache = IoCCache(ttl=ttl)
 
         if refresh_ioc:
             self.cache.clear()
@@ -228,7 +293,20 @@ class ShaiHuludScanner:
             Colors.disable()
 
         self.compromised_packages: dict[str, set[str]] = {}
-        self._load_ioc_lists()
+        self.ioc_status: IoCDataStatus = self._load_ioc_lists()
+
+        # Fail early if strict mode and data is stale/missing
+        if self.strict:
+            if not self.ioc_status.is_available:
+                raise RuntimeError(
+                    "--strict specified but no IoC data available. "
+                    "Check network connectivity or cache."
+                )
+            if self.ioc_status.is_stale:
+                raise RuntimeError(
+                    f"--strict specified but IoC data source is '{self.ioc_status.source}'. "
+                    "Fresh network data required."
+                )
 
     def _log(self, message: str, level: str = "info") -> None:
         """Log message if not in JSON mode."""
@@ -249,41 +327,181 @@ class ShaiHuludScanner:
 
         print(f"{prefix}{message}")
 
-    def _fetch_json(self, url: str) -> dict | list | None:
-        """Fetch JSON from URL with caching."""
-        cached = self.cache.get(url)
-        if cached is not None:
-            self._log(f"Using cached IoC data for {url}")
-            return cached
+    def _fetch_with_retry(
+        self,
+        url: str,
+        max_attempts: int = RETRY_ATTEMPTS,
+    ) -> tuple[dict | list | None, str | None]:
+        """
+        Fetch JSON from URL with exponential backoff retry.
 
-        try:
-            self._log(f"Fetching IoC data from {url}")
-            response = requests.get(url, timeout=30)
-            response.raise_for_status()
-            data = response.json()
-            self.cache.set(url, data)
-            return data
-        except requests.RequestException as e:
-            self._log(f"Failed to fetch {url}: {e}", "warning")
-            return None
+        Returns:
+            Tuple of (data, error_message). Data is None on failure.
+        """
+        last_error = None
 
-    def _load_ioc_lists(self) -> None:
-        """Load compromised package lists from IoC sources."""
-        # Tenable list
-        tenable_data = self._fetch_json(IOC_SOURCES["tenable"])
-        if tenable_data and isinstance(tenable_data, list):
-            for entry in tenable_data:
+        for attempt in range(max_attempts):
+            try:
+                if attempt > 0:
+                    backoff = min(
+                        RETRY_BACKOFF_BASE * (2 ** (attempt - 1)),
+                        RETRY_BACKOFF_MAX,
+                    )
+                    self._log(
+                        f"Retry attempt {attempt + 1}/{max_attempts} after {backoff:.1f}s",
+                        "info",
+                    )
+                    time.sleep(backoff)
+
+                self._log(f"Fetching IoC data from {url}")
+                response = requests.get(url, timeout=30)
+                response.raise_for_status()
+                return response.json(), None
+
+            except requests.Timeout as e:
+                last_error = f"Request timed out: {e}"
+                self._log(f"Attempt {attempt + 1} failed: {last_error}", "warning")
+            except requests.ConnectionError as e:
+                last_error = f"Connection failed: {e}"
+                self._log(f"Attempt {attempt + 1} failed: {last_error}", "warning")
+            except requests.HTTPError as e:
+                last_error = f"HTTP error: {e}"
+                self._log(f"Attempt {attempt + 1} failed: {last_error}", "warning")
+            except requests.RequestException as e:
+                last_error = f"Request failed: {e}"
+                self._log(f"Attempt {attempt + 1} failed: {last_error}", "warning")
+            except json.JSONDecodeError as e:
+                last_error = f"Invalid JSON response: {e}"
+                self._log(f"Attempt {attempt + 1} failed: {last_error}", "warning")
+                break  # Don't retry JSON parse errors
+
+        return None, last_error
+
+    def _parse_tenable_format(self, data: dict | list) -> dict[str, set[str]]:
+        """
+        Parse IoC data into internal format.
+
+        Handles both formats:
+        - New: {"package-name": {"vuln_vers": ["v1", "v2"]}}
+        - Old: [{"name": "x", "version": "y"}]
+        """
+        packages: dict[str, set[str]] = {}
+
+        if isinstance(data, dict):
+            # New format: {"package-name": {"vuln_vers": ["v1", "v2"]}}
+            for pkg_name, pkg_info in data.items():
+                if isinstance(pkg_info, dict) and "vuln_vers" in pkg_info:
+                    versions = pkg_info["vuln_vers"]
+                    if isinstance(versions, list):
+                        packages[pkg_name] = set(versions)
+        elif isinstance(data, list):
+            # Old format: [{"name": "x", "version": "y"}]
+            for entry in data:
                 name = entry.get("name")
                 version = entry.get("version")
                 if name and version:
-                    if name not in self.compromised_packages:
-                        self.compromised_packages[name] = set()
-                    self.compromised_packages[name].add(version)
+                    if name not in packages:
+                        packages[name] = set()
+                    packages[name].add(version)
 
-        self._log(
-            f"Loaded {len(self.compromised_packages)} compromised packages",
-            "info" if self.compromised_packages else "warning",
-        )
+        return packages
+
+    def _fetch_json(self, url: str) -> tuple[dict | list | None, IoCDataStatus]:
+        """
+        Fetch JSON with multi-layer fallback.
+
+        Fallback order:
+        1. Fresh network fetch (with retry)
+        2. Valid cache (< TTL)
+        3. Expired cache (with warning)
+        4. Bundled baseline (with warning)
+
+        Returns:
+            Tuple of (data, status)
+        """
+        # Skip network if offline mode
+        if self.offline_mode:
+            self._log("Offline mode: skipping network fetch", "info")
+        else:
+            # Try network fetch with retry
+            data, error = self._fetch_with_retry(url)
+            if data is not None:
+                self.cache.set(url, data)
+                return data, IoCDataStatus(
+                    source="network",
+                    age_seconds=0,
+                )
+
+            self._log(f"Network fetch failed: {error}", "warning")
+
+        # Try valid cache
+        cached_data, cache_age = self.cache.get(url, allow_expired=False)
+        if cached_data is not None:
+            self._log(f"Using cached IoC data ({cache_age / 3600:.1f}h old)")
+            return cached_data, IoCDataStatus(
+                source="cache",
+                age_seconds=cache_age,
+            )
+
+        # Try expired cache
+        cached_data, cache_age = self.cache.get(url, allow_expired=True)
+        if cached_data is not None:
+            self._log(
+                f"Using EXPIRED cached IoC data ({cache_age / 3600:.1f}h old) - "
+                "network unavailable",
+                "warning",
+            )
+            return cached_data, IoCDataStatus(
+                source="expired_cache",
+                age_seconds=cache_age,
+            )
+
+        # Fall back to bundled baseline
+        try:
+            from baseline_iocs import BASELINE_COMPROMISED_PACKAGES, BASELINE_IOC_VERSION
+
+            if BASELINE_COMPROMISED_PACKAGES:
+                self._log(
+                    f"Using BUNDLED baseline IoC data (version {BASELINE_IOC_VERSION}) - "
+                    "network and cache unavailable",
+                    "warning",
+                )
+                return BASELINE_COMPROMISED_PACKAGES, IoCDataStatus(
+                    source="bundled",
+                    age_seconds=None,
+                )
+        except ImportError:
+            pass
+
+        # No data available
+        return None, IoCDataStatus(source="none")
+
+    def _load_ioc_lists(self) -> IoCDataStatus:
+        """
+        Load compromised package lists from IoC sources.
+
+        Returns:
+            IoCDataStatus indicating data source and freshness
+        """
+        tenable_data, status = self._fetch_json(IOC_SOURCES["tenable"])
+
+        if tenable_data:
+            self.compromised_packages = self._parse_tenable_format(tenable_data)
+            status.package_count = len(self.compromised_packages)
+
+        if status.is_available:
+            level = "warning" if status.is_stale else "info"
+            self._log(
+                f"Loaded {status.package_count} compromised packages from {status.source}",
+                level,
+            )
+        else:
+            self._log(
+                "WARNING: No IoC data available! Compromised package detection disabled.",
+                "error",
+            )
+
+        return status
 
     def find_repos(self, root: Path) -> Iterator[Path]:
         """Find all git repositories under root path."""
@@ -593,10 +811,17 @@ class ShaiHuludScanner:
         return results
 
     def print_summary(self, results: list[ScanResult]) -> None:
-        """Print scan summary."""
+        """Print scan summary including IoC data status."""
         if self.json_output:
             output = {
                 "scan_results": [r.to_dict() for r in results],
+                "ioc_data": {
+                    "source": self.ioc_status.source,
+                    "is_stale": self.ioc_status.is_stale,
+                    "is_available": self.ioc_status.is_available,
+                    "age": self.ioc_status.age_human,
+                    "package_count": self.ioc_status.package_count,
+                },
                 "summary": {
                     "total_repos": len(results),
                     "clean_repos": sum(1 for r in results if r.is_clean),
@@ -606,6 +831,18 @@ class ShaiHuludScanner:
             }
             print(json.dumps(output, indent=2))
             return
+
+        # Print IoC data status banner for text output
+        if not self.ioc_status.is_available:
+            print(f"\n{Colors.RED}[ERROR] No IoC data available!{Colors.RESET}")
+            print("  Compromised package detection is DISABLED.")
+            print("  Connect to network or ensure cache/baseline is available.\n")
+        elif self.ioc_status.is_stale:
+            print(f"\n{Colors.YELLOW}[WARNING] IoC data is stale!{Colors.RESET}")
+            print(f"  Source: {self.ioc_status.source}")
+            if self.ioc_status.age_seconds:
+                print(f"  Age: {self.ioc_status.age_human}")
+            print("  Run with network access to get fresh data.\n")
 
         clean_count = sum(1 for r in results if r.is_clean)
         infected_count = len(results) - clean_count
@@ -684,29 +921,65 @@ Examples:
         action="store_true",
         help="Enable verbose output",
     )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Exit with error if fresh IoC data is unavailable (stale or missing)",
+    )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Skip network fetch, use cached or bundled data only",
+    )
+    parser.add_argument(
+        "--max-cache-age",
+        type=int,
+        metavar="HOURS",
+        help="Maximum cache age in hours before considering stale (default: 24)",
+    )
 
     args = parser.parse_args()
 
     if not args.path.exists():
         print(f"Error: Path does not exist: {args.path}", file=sys.stderr)
-        return 1
+        return EXIT_FINDINGS
 
     if not args.path.is_dir():
         print(f"Error: Path is not a directory: {args.path}", file=sys.stderr)
-        return 1
+        return EXIT_FINDINGS
 
-    scanner = ShaiHuludScanner(
-        verbose=args.verbose,
-        refresh_ioc=args.refresh_ioc,
-        json_output=args.json,
-    )
+    try:
+        scanner = ShaiHuludScanner(
+            verbose=args.verbose,
+            refresh_ioc=args.refresh_ioc,
+            json_output=args.json,
+            strict=args.strict,
+            offline=args.offline,
+            max_cache_age=args.max_cache_age,
+        )
+    except RuntimeError as e:
+        if args.json:
+            print(json.dumps({"error": str(e)}), file=sys.stderr)
+        else:
+            print(f"{Colors.RED}Error:{Colors.RESET} {e}", file=sys.stderr)
+        return EXIT_NO_IOC_DATA
 
     results = scanner.scan(args.path)
     scanner.print_summary(results)
 
-    # Return non-zero exit code if any findings
+    # Return appropriate exit code
     has_findings = any(not r.is_clean for r in results)
-    return 1 if has_findings else 0
+    if has_findings:
+        return EXIT_FINDINGS
+
+    # Note about stale data even on clean scan (text mode only)
+    if scanner.ioc_status.is_stale and not args.json:
+        print(
+            f"\n{Colors.YELLOW}Note:{Colors.RESET} Scan used stale IoC data. "
+            "Results may miss newly compromised packages."
+        )
+
+    return EXIT_CLEAN
 
 
 if __name__ == "__main__":

@@ -20,6 +20,14 @@ uv run python shai_hulud_scanner.py ~/Projects        # Scan repos under a direc
 uv run python shai_hulud_scanner.py . --json          # Output as JSON
 uv run python shai_hulud_scanner.py ~/Projects --refresh  # Force refresh IoC cache
 uv run python shai_hulud_scanner.py ~/Projects -v     # Verbose output
+uv run python shai_hulud_scanner.py ~/Projects --strict   # Fail if fresh IoC data unavailable
+uv run python shai_hulud_scanner.py ~/Projects --offline  # Use cached/bundled data only
+uv run python shai_hulud_scanner.py ~/Projects --max-cache-age 48  # Custom cache TTL (hours)
+```
+
+### Updating Bundled IoC Data
+```bash
+uv run python scripts/update_baseline.py  # Fetch and bundle current IoC list
 ```
 
 ### Linting
@@ -39,6 +47,10 @@ The scanner (`shai_hulud_scanner.py`) is a single-file module with these key com
   - Searches for known malicious files: `setup_bun.js`, `bun_environment.js`, exfiltration JSONs, suspicious workflows
 
 - **IoCCache**: Handles 24-hour caching of IoC lists in `~/.cache/shai-hulud-scanner/`
+  - Supports expired cache fallback when network is unavailable
+  - Falls back to bundled baseline if no cache exists
+
+- **IoCDataStatus**: Tracks the source and freshness of IoC data (network, cache, expired_cache, bundled, none)
 
 - **Finding/ScanResult**: Dataclasses for structured results with severity levels (critical/high/medium/low)
 
@@ -49,4 +61,20 @@ The scanner checks for:
 4. Compromised packages in lockfiles (matched against Tenable's IoC list)
 5. Suspicious preinstall scripts in `package.json`
 
-Exit code is 0 if clean, 1 if any findings detected.
+## Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Clean scan |
+| 1 | Findings detected |
+| 2 | No IoC data available (only with `--strict`) |
+
+## Offline Behavior
+
+The scanner uses a multi-layer fallback system:
+1. Fresh network fetch (with retry + exponential backoff)
+2. Valid cache (< 24h by default)
+3. Expired cache (with warning)
+4. Bundled baseline from `baseline_iocs.py` (with warning)
+
+Use `--strict` in CI/CD to fail if only stale data is available.

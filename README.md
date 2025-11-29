@@ -45,6 +45,15 @@ uv run shai-hulud-scanner ~/Projects --refresh
 
 # Enable verbose output
 uv run shai-hulud-scanner ~/Projects -v
+
+# Strict mode - fail if fresh IoC data is unavailable
+uv run shai-hulud-scanner ~/Projects --strict
+
+# Offline mode - skip network, use cached/bundled data only
+uv run shai-hulud-scanner ~/Projects --offline
+
+# Custom cache TTL (in hours)
+uv run shai-hulud-scanner ~/Projects --max-cache-age 48
 ```
 
 ### CLI Arguments
@@ -55,6 +64,9 @@ uv run shai-hulud-scanner ~/Projects -v
 | `--json` | Output results in JSON format |
 | `--refresh`, `--refresh-ioc` | Force refresh of cached IoC lists |
 | `-v`, `--verbose` | Enable verbose output with detailed info messages |
+| `--strict` | Exit with error if fresh IoC data is unavailable (stale or missing) |
+| `--offline` | Skip network fetch, use cached or bundled data only |
+| `--max-cache-age HOURS` | Maximum cache age in hours before considering stale (default: 24) |
 
 ## Output Formats
 
@@ -90,6 +102,13 @@ Includes a summary with total repos scanned, clean/infected counts, and recommen
       "scanned_at": 1732000000.123
     }
   ],
+  "ioc_data": {
+    "source": "network",
+    "is_stale": false,
+    "is_available": true,
+    "age": "0 minutes",
+    "package_count": 802
+  },
   "summary": {
     "total_repos": 10,
     "clean_repos": 8,
@@ -105,6 +124,7 @@ Includes a summary with total repos scanned, clean/infected counts, and recommen
 |------|---------|
 | `0` | All repositories clean, no findings detected |
 | `1` | Findings detected or error occurred |
+| `2` | No IoC data available (only with `--strict` flag) |
 
 ## Supported Lockfile Formats
 
@@ -118,13 +138,32 @@ The scanner parses the following lockfile formats to detect compromised package 
 
 Compromised package lists are fetched from [Tenable's affected packages repository](https://github.com/tenable/shai-hulud-second-coming-affected-packages).
 
-## Caching
+## Caching and Offline Behavior
 
 IoC lists are cached locally to avoid repeated network requests:
 
 - **Cache location**: `~/.cache/shai-hulud-scanner/`
-- **Cache TTL**: 24 hours
+- **Cache TTL**: 24 hours (configurable with `--max-cache-age`)
 - **Force refresh**: Use `--refresh` or `--refresh-ioc` flag
+
+### Fallback Chain
+
+The scanner uses a multi-layer fallback system for resilience:
+
+1. **Fresh network fetch** - With retry and exponential backoff (3 attempts)
+2. **Valid cache** - Data less than 24 hours old
+3. **Expired cache** - Stale data with warning
+4. **Bundled baseline** - Ships with the scanner, updated at release time
+
+Use `--strict` in CI/CD pipelines to fail if only stale data is available.
+
+### Updating Bundled Baseline
+
+To refresh the bundled IoC data before a release:
+
+```bash
+uv run python scripts/update_baseline.py
+```
 
 ## Development
 
