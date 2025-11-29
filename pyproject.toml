@@ -1,0 +1,24 @@
+[project]
+name = "shai-hulud-scanner"
+version = "0.1.0"
+description = "Scanner for Shai Hulud 2.0 npm supply chain worm IoCs"
+requires-python = ">=3.13"
+dependencies = [
+    "pyyaml>=6.0.3",
+    "requests>=2.32.5",
+]
+
+[project.scripts]
+shai-hulud-scanner = "shai_hulud_scanner:main"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.14.7",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]

@@ -1,0 +1,24 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Environment and secrets
+.env
+.env.*
+*.key
+*.pem
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# macOS
+.DS_Store
